@@ -3,6 +3,8 @@
   python -I -X utf8 kakao.py rooms                 열려 있는 대화방 목록 (백그라운드)
   python -I -X utf8 kakao.py read <방이름> [줄수]   대화 읽기 (백그라운드. 클립보드를 잠깐 쓰고 글자만 되돌린다)
   python -I -X utf8 kakao.py send <방이름> <메시지> 메시지 보내기 (창이 앞으로 나오고 마우스가 움직인다)
+  python -I -X utf8 kakao.py image <방이름> <그림>  사진으로 보내기 (화면 조작. 클립보드 내용이 사라진다)
+  python -I -X utf8 kakao.py file <방이름> <파일>   파일로 보내기 (화면 조작)
   python -I -X utf8 kakao.py selftest              창을 건드리지 않는 자체 점검
 
 대화방은 미리 열려 있어야 한다. 방이름은 창 제목과 정확히 같아야 한다.
@@ -57,23 +59,92 @@ def tap(vk, ctrl=False):
     time.sleep(0.4)
 
 
-def send(name, text):
-    """화면 조작 방식. 창이 앞으로 나오고 마우스가 움직인다.
-    ponytail: 이 카카오톡 버전은 신호로 보낸 Enter를 무시해서 백그라운드 전송이 안 된다. 되는 방법을 찾으면 바꾼다."""
-    h = room(name)
-    user32.SetProcessDPIAware()
-    l, t, r, b = win32gui.GetWindowRect(h)
-    win32api.SetCursorPos(((l + r) // 2, b - 110))  # 입력칸을 클릭해 창을 앞으로. Alt 키는 메뉴를 열어서 쓰지 않는다
+def raise_window(h):
+    """다른 창에 가려져 있으면 클릭이 엉뚱한 창으로 가니까 먼저 맨 위로 올린다."""
+    if win32gui.IsIconic(h):
+        win32gui.ShowWindow(h, win32con.SW_RESTORE)
+    f = win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE
+    win32gui.SetWindowPos(h, win32con.HWND_TOPMOST, 0, 0, 0, 0, f)
+    win32gui.SetWindowPos(h, win32con.HWND_NOTOPMOST, 0, 0, 0, 0, f)
+    time.sleep(0.4)
+
+
+def click(x, y):
+    win32api.SetCursorPos((x, y))
     win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
     win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
     time.sleep(0.8)
+
+
+def focus_room(name):
+    """대화방을 맨 위로 올리고 입력칸을 클릭한다. 다른 창이 앞에 있으면 아무것도 보내지 않고 끝낸다.
+    ponytail: 이 카카오톡 버전은 신호로 보낸 Enter를 무시해서 백그라운드 전송이 안 된다. 되는 방법을 찾으면 바꾼다."""
+    h = room(name)
+    user32.SetProcessDPIAware()
+    raise_window(h)
+    l, t, r, b = win32gui.GetWindowRect(h)
+    click((l + r) // 2, b - 110)  # Alt 키는 창 메뉴를 열어서 쓰지 않는다
     if win32gui.GetForegroundWindow() != h or win32gui.GetWindowText(h) != name:
         sys.exit("대화방을 앞으로 못 가져와서 보내지 않음")
+    return h
+
+
+def confirm_popup(h, what):
+    """사진이나 파일을 고르면 뜨는 카카오톡 전송 확인 창에서 Enter를 누른다."""
+    time.sleep(1.5)
+    f = win32gui.GetForegroundWindow()
+    if f == h or win32process.GetWindowThreadProcessId(f)[1] not in kakao_pids():
+        sys.exit("%s 전송 창이 안 떠서 보내지 않음" % what)
+    tap(win32con.VK_RETURN)
+    time.sleep(2)
+
+
+def send(name, text):
+    """글자 보내기. 창이 앞으로 나오고 마우스가 움직인다."""
+    focus_room(name)
     old = clip_get()
     clip_set(text)
     tap(ord("V"), ctrl=True)
     tap(win32con.VK_RETURN)
     clip_set(old)
+
+
+def send_image(name, path):
+    """사진으로 보내기. 그림을 클립보드에 넣고 입력칸에 붙여넣는다. 클립보드 내용은 사라진다."""
+    import io
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.open(path).convert("RGB").save(buf, "BMP")
+    h = focus_room(name)
+    win32clipboard.OpenClipboard()
+    try:
+        win32clipboard.EmptyClipboard()
+        win32clipboard.SetClipboardData(win32con.CF_DIB, buf.getvalue()[14:])  # BMP 파일 머리 14바이트를 뺀 것이 DIB
+    finally:
+        win32clipboard.CloseClipboard()
+    tap(ord("V"), ctrl=True)
+    confirm_popup(h, "사진")
+
+
+def send_file(name, path):
+    """파일로 보내기. 대화방 아래의 파일 버튼을 누르고 열기 창에 경로를 넣는다.
+    복사한 파일을 Ctrl+V로 붙여넣는 방법은 이 카카오톡 버전에서 안 먹힌다."""
+    import os
+    path = os.path.abspath(path)
+    open(path, "rb").close()
+    h = focus_room(name)
+    l, t, r, b = win32gui.GetWindowRect(h)
+    click(l + 108, b - 30)  # 파일 버튼 (+, 이모티콘, 파일 순서의 세 번째)
+    time.sleep(1.2)
+    f = win32gui.GetForegroundWindow()
+    if win32gui.GetClassName(f) != "#32770" or win32gui.GetWindow(f, win32con.GW_OWNER) != h:
+        sys.exit("파일 열기 창이 안 떠서 보내지 않음")
+    old = clip_get()
+    clip_set(path)
+    tap(ord("V"), ctrl=True)
+    tap(win32con.VK_RETURN)
+    clip_set(old)
+    confirm_popup(h, "파일")
 
 
 def post_key(hwnd, key, mod):
@@ -153,6 +224,12 @@ if __name__ == "__main__":
     elif cmd == "send":
         send(sys.argv[2], sys.argv[3])
         print("보냄:", sys.argv[2])
+    elif cmd == "image":
+        send_image(sys.argv[2], sys.argv[3])
+        print("사진 보냄:", sys.argv[2])
+    elif cmd == "file":
+        send_file(sys.argv[2], sys.argv[3])
+        print("파일 보냄:", sys.argv[2])
     elif cmd == "selftest":
         selftest()
     else:

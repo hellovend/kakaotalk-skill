@@ -4,7 +4,7 @@
 
 - 열려 있는 대화방 목록 보기
 - 대화 읽기
-- 메시지 보내기
+- 메시지, 사진, 파일 보내기
 
 자세한 사용법과 한계는 [skills/kakaotalk/SKILL.md](skills/kakaotalk/SKILL.md)에 있다.
 
