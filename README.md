@@ -3,7 +3,7 @@
 카카오톡 PC 버전을 Claude Code에서 다루는 스킬이다. Windows 전용.
 
 - 열려 있는 대화방 목록 보기
-- 대화 읽기
+- 대화 읽기, 새 메시지 기다렸다가 읽기
 - 메시지, 사진, 파일 보내기
 
 자세한 사용법과 한계는 [skills/kakaotalk/SKILL.md](skills/kakaotalk/SKILL.md)에 있다.

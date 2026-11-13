@@ -2,6 +2,7 @@
 
   python -I -X utf8 kakao.py rooms                 열려 있는 대화방 목록 (백그라운드)
   python -I -X utf8 kakao.py read <방이름> [줄수]   대화 읽기 (백그라운드. 클립보드를 잠깐 쓰고 글자만 되돌린다)
+  python -I -X utf8 kakao.py watch <방이름> [초]    새 메시지가 올 때까지 기다렸다가 화면 글자 인식으로 읽기 (백그라운드. 키보드와 클립보드 안 씀)
   python -I -X utf8 kakao.py send <방이름> <메시지> 메시지 보내기 (창이 앞으로 나오고 마우스가 움직인다)
   python -I -X utf8 kakao.py image <방이름> <그림>  사진으로 보내기 (화면 조작. 클립보드 내용이 사라진다)
   python -I -X utf8 kakao.py file <방이름> <파일>   파일로 보내기 (화면 조작)
@@ -204,6 +205,90 @@ def read(name, lines=30):
     return tail(got, lines)
 
 
+def capture(h):
+    """PrintWindow로 창을 캡처한다. 다른 창에 가려져 있어도 되고 키보드나 마우스는 건드리지 않는다.
+    최소화된 창은 캡처되지 않는다."""
+    import win32ui
+    from PIL import Image
+    user32.SetProcessDPIAware()
+    l, t, r, b = win32gui.GetWindowRect(h)
+    w, ht = r - l, b - t
+    hdc = win32gui.GetWindowDC(h)
+    src = win32ui.CreateDCFromHandle(hdc)
+    mem = src.CreateCompatibleDC()
+    bmp = win32ui.CreateBitmap()
+    bmp.CreateCompatibleBitmap(src, w, ht)
+    mem.SelectObject(bmp)
+    try:
+        user32.PrintWindow(h, mem.GetSafeHdc(), 2)  # 2 = PW_RENDERFULLCONTENT
+        return Image.frombuffer("RGB", (w, ht), bmp.GetBitmapBits(True), "raw", "BGRX", 0, 1)
+    finally:
+        win32gui.DeleteObject(bmp.GetHandle())
+        mem.DeleteDC()
+        src.DeleteDC()
+        win32gui.ReleaseDC(h, hdc)
+
+
+def chat_area(img):
+    """제목줄과 입력칸을 뺀 대화 부분. 입력칸에서 타자 치는 건 변화로 치지 않는다."""
+    s = img.width / 475  # 화면 배율이 달라도 비율로 자른다
+    return img.crop((0, int(110 * s), img.width, img.height - int(145 * s)))
+
+
+def ocr(img):
+    """윈도우 기본 글자 인식(한국어)으로 읽은 줄 목록. 글자가 조금씩 틀릴 수 있다."""
+    import os, subprocess, tempfile
+    from PIL import Image
+    fd, tmp = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    try:
+        img.resize((img.width * 2, img.height * 2), Image.LANCZOS).save(tmp)  # 키우면 더 잘 읽힌다
+        ps1 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ocr.ps1")
+        out = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1, tmp],
+                             capture_output=True, timeout=60).stdout.decode("utf-8", "replace")
+    finally:
+        os.remove(tmp)
+    return [ln.split("\t", 1)[1].strip() for ln in out.splitlines() if "\t" in ln and ln.split("\t", 1)[1].strip()]
+
+
+def new_lines(before, after):
+    """after에서 before에 없던 줄만 순서대로. 같은 줄이 여러 번 있으면 개수로 센다."""
+    left = {}
+    for x in before:
+        left[x] = left.get(x, 0) + 1
+    out = []
+    for x in after:
+        if left.get(x):
+            left[x] -= 1
+        else:
+            out.append(x)
+    return out
+
+
+def watch(name, timeout=300, interval=2.0):
+    """새 메시지가 올 때까지 대화 부분을 캡처해서 비교한다. 바뀌면 글자를 인식해서 새 줄을 돌려준다.
+    키보드, 마우스, 클립보드를 쓰지 않아서 사용자가 타자를 쳐도 방해하지 않는다.
+    ponytail: 화면 글자 인식이라 글자가 틀릴 수 있고 화면에 보이는 부분만 읽는다. 정확한 원문이 필요하면 read를 쓴다."""
+    h = room(name)
+    first = chat_area(capture(h))
+    base = ocr(first)
+    last = first.tobytes()
+    end = time.time() + timeout
+    while time.time() < end:
+        time.sleep(interval)
+        if not win32gui.IsWindow(h):
+            sys.exit("대화방 창이 닫힘")
+        now = chat_area(capture(h)).tobytes()
+        if now == last:
+            continue
+        time.sleep(1)  # 화면이 다 그려질 때까지 기다린다
+        got = new_lines(base, ocr(chat_area(capture(h))))
+        if got:
+            return got
+        last = now
+    return []
+
+
 def tail(text, lines):
     rows = [r for r in text.replace("\r\n", "\n").split("\n") if r.strip()]
     return "\n".join(rows[-lines:])
@@ -212,6 +297,8 @@ def tail(text, lines):
 def selftest():
     assert tail("a\r\n\r\nb\nc\n", 2) == "b\nc"
     assert tail("a", 5) == "a"
+    assert new_lines(["a", "b", "a"], ["b", "a", "a", "c", "a"]) == ["c", "a"]
+    assert new_lines([], ["x"]) == ["x"]
     print("ok")
 
 
@@ -224,6 +311,9 @@ if __name__ == "__main__":
     elif cmd == "send":
         send(sys.argv[2], sys.argv[3])
         print("보냄:", sys.argv[2])
+    elif cmd == "watch":
+        got = watch(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 300)
+        print("\n".join(got) if got else "새 메시지 없음")
     elif cmd == "image":
         send_image(sys.argv[2], sys.argv[3])
         print("사진 보냄:", sys.argv[2])
