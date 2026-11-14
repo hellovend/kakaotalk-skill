@@ -1,14 +1,15 @@
-"""카카오톡 PC 조작. 목록과 읽기는 백그라운드로 되고 보내기는 화면 조작 방식이다.
+"""카카오톡 PC 조작. 모든 명령이 창에 보내는 신호로 동작해서 마우스와 키보드를 뺏지 않는다.
 
   python -E -X utf8 kakao.py rooms                 열려 있는 대화방 목록 (백그라운드)
   python -E -X utf8 kakao.py read <방이름> [줄수]   대화 읽기 (백그라운드. 클립보드를 잠깐 쓰고 되돌린다)
   python -E -X utf8 kakao.py watch <방이름> [초]    새 메시지가 올 때까지 기다렸다가 화면 글자 인식으로 읽기 (백그라운드. 키보드와 클립보드 안 씀)
-  python -E -X utf8 kakao.py send <방이름> <메시지> 메시지 보내기 (창이 앞으로 나오고 마우스가 움직인다)
-  python -E -X utf8 kakao.py image <방이름> <그림>  사진으로 보내기 (화면 조작)
-  python -E -X utf8 kakao.py file <방이름> <파일>   파일로 보내기 (화면 조작)
+  python -E -X utf8 kakao.py open <친구이름|나>     카카오톡을 켜고 대화방 열기 (백그라운드. '나'는 나와의 채팅)
+  python -E -X utf8 kakao.py send <방이름> <메시지> 메시지 보내기 (백그라운드. 입력칸의 쓰다 만 글은 되돌린다)
+  python -E -X utf8 kakao.py image <방이름> <그림>  사진으로 보내기 (백그라운드. 클립보드를 잠깐 쓰고 되돌린다)
+  python -E -X utf8 kakao.py file <방이름> <파일>   파일로 보내기 (백그라운드. 파일 열기 창이 화면에 잠깐 뜬다)
   python -E -X utf8 kakao.py selftest              창을 건드리지 않는 자체 점검
 
-대화방은 미리 열려 있어야 한다. 방이름은 창 제목과 정확히 같아야 한다.
+대화방은 열려 있어야 한다(open으로 열 수 있다). 방이름은 창 제목과 정확히 같아야 한다.
 """
 import contextlib, ctypes, sys, time
 from difflib import SequenceMatcher
@@ -68,98 +69,194 @@ def scale(h):
     return user32.GetDpiForWindow(h) / 96
 
 
-def tap(vk, ctrl=False):
-    if ctrl:
-        win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
-    win32api.keybd_event(vk, 0, 0, 0)
-    win32api.keybd_event(vk, 0, win32con.KEYEVENTF_KEYUP, 0)
-    if ctrl:
-        win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
-    time.sleep(0.4)
+def press(hwnd, vk):
+    """키 하나를 창에 신호로 보낸다. 창을 앞으로 가져오거나 실제 키보드를 쓰지 않는다."""
+    sc = win32api.MapVirtualKey(vk, 0) << 16
+    win32api.PostMessage(hwnd, win32con.WM_KEYDOWN, vk, sc | 1)
+    time.sleep(0.05)
+    if win32gui.IsWindow(hwnd):  # 확인 창은 Enter를 누르는 순간 닫힌다
+        win32api.PostMessage(hwnd, win32con.WM_KEYUP, vk, sc | 0xC0000001)
 
 
-def raise_window(h):
-    """다른 창에 가려져 있으면 클릭이 엉뚱한 창으로 가니까 먼저 맨 위로 올린다."""
-    if win32gui.IsIconic(h):
-        win32gui.ShowWindow(h, win32con.SW_RESTORE)
-    f = win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE
-    win32gui.SetWindowPos(h, win32con.HWND_TOPMOST, 0, 0, 0, 0, f)
-    win32gui.SetWindowPos(h, win32con.HWND_NOTOPMOST, 0, 0, 0, 0, f)
-    time.sleep(0.4)
+def tap_at(hwnd, x, y, double=False):
+    """창 안의 (x, y)를 클릭 신호로 누른다. 실제 마우스는 움직이지 않는다."""
+    lp = (y << 16) | x
+    win32gui.SendMessage(hwnd, win32con.WM_MOUSEMOVE, 0, lp)  # 카카오톡 버튼은 마우스가 올라가 있어야 눌린다
+    time.sleep(0.3)
+    win32gui.SendMessage(hwnd, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, lp)
+    time.sleep(0.08)
+    win32api.PostMessage(hwnd, win32con.WM_LBUTTONUP, 0, lp)
+    if double:
+        time.sleep(0.08)
+        win32api.PostMessage(hwnd, win32con.WM_LBUTTONDBLCLK, win32con.MK_LBUTTON, lp)
+        win32api.PostMessage(hwnd, win32con.WM_LBUTTONUP, 0, lp)
 
 
-def click(x, y):
-    win32api.SetCursorPos((x, y))
-    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-    time.sleep(0.8)
+def get_text(hwnd):
+    """다른 프로그램 입력칸의 글자. GetWindowText는 남의 입력칸을 못 읽어서 WM_GETTEXT를 직접 보낸다.
+    카카오톡 입력칸은 비어 있으면 안내 문구 '메시지 입력'을 돌려줘서 빈 글자로 바꾼다."""
+    n = win32gui.SendMessage(hwnd, win32con.WM_GETTEXTLENGTH, 0, 0) + 1
+    buf = ctypes.create_unicode_buffer(n)
+    user32.SendMessageW(hwnd, win32con.WM_GETTEXT, n, buf)
+    return "" if buf.value == "메시지 입력" else buf.value
 
 
-def focus_room(name):
-    """대화방을 맨 위로 올리고 입력칸 가운데를 클릭한다. 다른 창이 앞에 있으면 아무것도 보내지 않고 끝낸다.
-    ponytail: 이 카카오톡 버전은 신호로 보낸 Enter를 무시해서 백그라운드 전송이 안 된다. 되는 방법을 찾으면 바꾼다."""
-    h = room(name)
-    raise_window(h)
-    l, t, r, b = win32gui.GetWindowRect(child(h, "RICHEDIT50W"))
-    click((l + r) // 2, (t + b) // 2)  # Alt 키는 창 메뉴를 열어서 쓰지 않는다
-    if win32gui.GetForegroundWindow() != h or win32gui.GetWindowText(h) != name:
-        sys.exit("대화방을 앞으로 못 가져와서 보내지 않음")
-    return h
+def kakao_windows():
+    pids, out = kakao_pids(), []
+    win32gui.EnumWindows(lambda w, _: out.append(w) if win32gui.IsWindowVisible(w)
+                         and win32process.GetWindowThreadProcessId(w)[1] in pids else None, None)
+    return out
 
 
-def confirm_popup(h, what):
-    """사진이나 파일을 고르면 뜨는 카카오톡 전송 확인 창에서 Enter를 누른다."""
-    time.sleep(1.5)
-    f = win32gui.GetForegroundWindow()
-    if f == h or win32process.GetWindowThreadProcessId(f)[1] not in kakao_pids():
+def wait_new_window(before, cls, timeout=5.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        new = [w for w in kakao_windows() if w not in before and win32gui.GetClassName(w) == cls]
+        if new:
+            return new[0]
+        time.sleep(0.2)
+    return None
+
+
+def confirm_popup(before, what):
+    """사진이나 파일을 넣으면 뜨는 카카오톡 전송 확인 창에 Enter 신호를 보내고 닫히는지 본다."""
+    p = wait_new_window(before, "EVA_Window_Dblclk")
+    if not p:
         sys.exit("%s 전송 창이 안 떠서 보내지 않음" % what)
-    tap(win32con.VK_RETURN)
-    time.sleep(2)
+    time.sleep(0.5)
+    press(child(p, "Edit") or p, win32con.VK_RETURN)  # 사진 창은 설명 입력칸이, 파일 창은 창 자체가 Enter를 받는다
+    end = time.time() + 5
+    while win32gui.IsWindow(p) and win32gui.IsWindowVisible(p):
+        if time.time() > end:
+            sys.exit("%s 전송 창이 안 닫힘. 카카오톡에서 직접 확인한다" % what)
+        time.sleep(0.2)
 
 
 def send(name, text):
-    """글자 보내기. 창이 앞으로 나오고 마우스가 움직인다."""
+    """글자 보내기. 입력칸에 Ctrl+V 신호로 붙여넣고 Enter 신호를 보낸다(백그라운드).
+    WM_SETTEXT로 넣으면 카카오톡이 글이 들어온 걸 몰라서 Enter가 안 먹는다. 붙여넣기는 알아챈다.
+    입력칸에 쓰다 만 글이 있으면 보낸 뒤 되돌린다."""
     if not text.strip():
         sys.exit("빈 메시지는 보내지 않음")
-    focus_room(name)
+    e = child(room(name), "RICHEDIT50W")
+    draft = get_text(e)
     with clipboard_borrowed():
         clip_put_text(text)
-        tap(ord("V"), ctrl=True)
-        tap(win32con.VK_RETURN)
+        win32gui.SendMessage(e, win32con.EM_SETSEL, 0, -1)  # 쓰다 만 글은 붙여넣기로 덮는다
+        post_key(e, ord("V"), win32con.VK_CONTROL)
+        time.sleep(0.4)
+    press(e, win32con.VK_RETURN)
+    time.sleep(0.8)
+    if get_text(e):
+        win32gui.SendMessage(e, win32con.WM_SETTEXT, 0, draft)
+        sys.exit("보내지 못함 (입력칸에 글자가 그대로 남음)")
+    if draft:
+        win32gui.SendMessage(e, win32con.WM_SETTEXT, 0, draft)
 
 
 def send_image(name, path):
-    """사진으로 보내기. 그림을 클립보드에 넣고 입력칸에 붙여넣는다."""
+    """사진으로 보내기. 그림을 클립보드에 넣고 입력칸에 Ctrl+V 신호를 보낸다(백그라운드)."""
     import io
     from PIL import Image
     buf = io.BytesIO()
     Image.open(path).convert("RGB").save(buf, "BMP")
-    h = focus_room(name)
+    e = child(room(name), "RICHEDIT50W")
+    before = kakao_windows()
     with clipboard_borrowed():
         clip_put([(win32con.CF_DIB, buf.getvalue()[14:])])  # BMP 파일 머리 14바이트를 뺀 것이 DIB
-        tap(ord("V"), ctrl=True)
-        confirm_popup(h, "사진")
+        post_key(e, ord("V"), win32con.VK_CONTROL)
+        confirm_popup(before, "사진")
 
 
 def send_file(name, path):
-    """파일로 보내기. 대화방 아래의 파일 버튼을 누르고 열기 창에 경로를 넣는다.
+    """파일로 보내기. 대화방 아래 파일 버튼에 클릭 신호를 보내고 열기 창에 경로를 넣는다(백그라운드).
     복사한 파일을 Ctrl+V로 붙여넣는 방법은 이 카카오톡 버전에서 안 먹힌다."""
     import os
     path = os.path.abspath(path)
     open(path, "rb").close()
-    h = focus_room(name)
-    l, t, r, b = win32gui.GetWindowRect(h)
+    h = room(name)
     s = scale(h)
-    click(l + int(108 * s), b - int(30 * s))  # 파일 버튼 (+, 이모티콘, 파일 순서의 세 번째)
-    time.sleep(1.2)
-    f = win32gui.GetForegroundWindow()
-    if win32gui.GetClassName(f) != "#32770" or win32gui.GetWindow(f, win32con.GW_OWNER) != h:
+    ht = win32gui.GetClientRect(h)[3]
+    before = kakao_windows()
+    tap_at(h, int(88 * s), ht - int(24 * s))  # 파일 버튼 (+, 이모티콘, 파일 순서의 세 번째)
+    d = wait_new_window(before, "#32770")
+    if not d or win32gui.GetWindow(d, win32con.GW_OWNER) != h:
         sys.exit("파일 열기 창이 안 떠서 보내지 않음")
-    with clipboard_borrowed():
-        clip_put_text(path)
-        tap(ord("V"), ctrl=True)
-        tap(win32con.VK_RETURN)
-    confirm_popup(h, "파일")
+    box = win32gui.GetDlgItem(d, 0x47C)  # 파일 이름 칸
+    if win32gui.GetClassName(box) != "Edit":
+        box = win32gui.FindWindowEx(win32gui.FindWindowEx(box, 0, "ComboBox", None), 0, "Edit", None)
+    before = kakao_windows()
+    win32gui.SendMessage(box, win32con.WM_SETTEXT, 0, path)
+    win32api.PostMessage(d, win32con.WM_COMMAND, win32con.IDOK, win32gui.GetDlgItem(d, win32con.IDOK))
+    confirm_popup(before, "파일")
+
+
+def main_window():
+    for w in kakao_windows():
+        if win32gui.GetWindowText(w) == "카카오톡" and win32gui.GetClassName(w) == "EVA_Window_Dblclk":
+            return w
+    return None
+
+
+def named_child(h, prefix):
+    found = []
+    win32gui.EnumChildWindows(h, lambda c, _: found.append(c) if win32gui.GetWindowText(c).startswith(prefix) else None, None)
+    return found[0] if found else None
+
+
+def start():
+    """카카오톡이 안 켜져 있으면 켜고 메인 창이 뜰 때까지 기다린다. 자동 로그인이 꺼져 있으면 사용자가 로그인해야 한다."""
+    import os, subprocess
+    m = main_window()
+    if m:
+        return m
+    for base in (os.environ.get("ProgramFiles", r"C:\Program Files"), os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")):
+        exe = os.path.join(base, "Kakao", "KakaoTalk", "KakaoTalk.exe")
+        if os.path.exists(exe):
+            break
+    else:
+        sys.exit("카카오톡 실행 파일을 못 찾음")
+    subprocess.Popen([exe])
+    for _ in range(30):
+        time.sleep(1)
+        m = main_window()
+        if m and named_child(m, "ContactListCtrl"):
+            time.sleep(2)  # 친구 목록이 다 그려질 때까지
+            return m
+    sys.exit("카카오톡이 30초 안에 안 떴음. 로그인 창이면 직접 로그인한다")
+
+
+def open_room(name):
+    """대화방 열기(백그라운드). name이 '나'면 나와의 채팅, 아니면 친구 목록에서 이름을 검색해 첫 결과를 연다.
+    ponytail: 단체방은 채팅 탭에 있어서 못 연다(채팅 탭 전환이 신호로는 안 먹힌다). 필요하면 직접 연다."""
+    if name != "나" and name in rooms():
+        return name
+    m = start()
+    lst = named_child(m, "ContactListCtrl")
+    edit = child(win32gui.GetParent(lst), "Edit")
+    s = scale(m)
+    before = kakao_windows()
+    post_key(lst, ord("F"), win32con.VK_CONTROL)  # 검색칸 열기
+    time.sleep(0.5)
+    win32gui.SendMessage(edit, win32con.WM_SETTEXT, 0, "")
+    if name == "나":
+        time.sleep(0.8)
+        row = 33  # 검색어가 비어 있으면 맨 위가 내 프로필
+    else:
+        for ch in name:  # WM_SETTEXT로 넣으면 검색이 안 돌아서 한 글자씩 보낸다
+            win32api.PostMessage(edit, win32con.WM_CHAR, ord(ch), 1)
+        time.sleep(1.2)
+        row = 53  # '친구 N' 머리줄 아래 첫 결과
+    tap_at(lst, int(160 * s), int(row * s), double=True)
+    h = wait_new_window(before, "EVA_Window_Dblclk")
+    win32gui.SendMessage(edit, win32con.WM_SETTEXT, 0, "")
+    press(edit, win32con.VK_ESCAPE)
+    if not h or not child(h, "RICHEDIT50W"):
+        sys.exit("대화방이 안 열림: " + name)
+    title = win32gui.GetWindowText(h)
+    if name != "나" and title != name:
+        sys.exit("검색 첫 결과가 다른 사람이라 열린 방: %s (찾은 이름: %s)" % (title, name))
+    return title
 
 
 def post_key(hwnd, key, mod):
@@ -395,13 +492,15 @@ def selftest():
 
 if __name__ == "__main__":
     a = sys.argv[1:]
-    need = {"rooms": 1, "read": 2, "watch": 2, "send": 3, "image": 3, "file": 3, "selftest": 1}
+    need = {"open": 2, "rooms": 1, "read": 2, "watch": 2, "send": 3, "image": 3, "file": 3, "selftest": 1}
     if not a or a[0] not in need or len(a) < need[a[0]]:
         sys.exit(__doc__)
     cmd = a[0]
     if cmd == "rooms":
         print("\n".join(t if len(hs) == 1 else "%s (같은 이름 창 %d개)" % (t, len(hs)) for t, hs in rooms().items())
               or "열린 대화방 없음")
+    elif cmd == "open":
+        print("열림:", open_room(a[1]))
     elif cmd == "read":
         print(read(a[1], int(a[2]) if len(a) > 2 else 30))
     elif cmd == "send":
