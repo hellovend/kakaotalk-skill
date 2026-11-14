@@ -15,10 +15,14 @@ $stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Wind
 $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
 $bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
 $null = [Windows.Globalization.Language, Windows.Globalization, ContentType = WindowsRuntime]
-$engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage([Windows.Globalization.Language]::new('ko'))
-$result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
-foreach ($line in $result.Lines) {
-    $y = [int]($line.Words | Select-Object -First 1).BoundingRect.Y
-    "{0}`t{1}" -f $y, $line.Text
+try {
+    $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage([Windows.Globalization.Language]::new('ko'))
+    if (-not $engine) { [Console]::Error.WriteLine('no-korean-ocr'); exit 2 }  # 한국어 언어 팩이 없다
+    $result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+    foreach ($line in $result.Lines) {
+        $y = [int]($line.Words | Select-Object -First 1).BoundingRect.Y
+        "{0}`t{1}" -f $y, $line.Text
+    }
+} finally {
+    $stream.Dispose()
 }
-$stream.Dispose()
